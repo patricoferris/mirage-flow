@@ -16,8 +16,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *)
 
-open Lwt.Infix
-
 let src = Logs.Src.create "mirage-flow-combinators"
 module Log = (val Logs.src_log src : Logs.LOG)
 
@@ -46,16 +44,16 @@ module Concrete (S: Mirage_flow.S) = struct
     | Error `Closed -> Error `Closed
     | Error e       -> Error (`Msg (Fmt.str "%a" S.pp_write_error e))
 
-  let read t = S.read t >|= lift_read
-  let write t b = S.write t b >|= lift_write
-  let writev t bs = S.writev t bs >|= lift_write
+  let read t = S.read t |> lift_read
+  let write t b = S.write t b |> lift_write
+  let writev t bs = S.writev t bs |> lift_write
   let close t = S.close t
 end
 
 module type SHUTDOWNABLE = sig
   include Mirage_flow.S
-  val shutdown_write: flow -> unit Lwt.t
-  val shutdown_read: flow -> unit Lwt.t
+  val shutdown_write: flow -> unit
+  val shutdown_read: flow -> unit
 end
 
 type time = int64
@@ -68,7 +66,7 @@ type 'a stats = {
   finish: time option ref;
   start: time;
   time: unit -> time;
-  t: (unit, 'a) result Lwt.t;
+  t: (unit, 'a) result Eio.Promise.or_exn;
 }
 
 let stats t =
@@ -83,42 +81,42 @@ let stats t =
     duration;
   }
 
-module Copy (Clock: Mirage_clock.MCLOCK) (A: Mirage_flow.S) (B: Mirage_flow.S) =
-struct
+module Copy = struct
+  open Eio
 
-  type error = [`A of A.error | `B of B.write_error]
+  type error = [ `A of exn | `B of exn ]
 
   let pp_error ppf = function
-    | `A e -> A.pp_error ppf e
-    | `B e -> B.pp_write_error ppf e
+    | `A exn -> Fmt.exn ppf exn
+    | `B exn -> Fmt.exn ppf exn
 
-  let start (a: A.flow) (b: B.flow) =
+  let start ~sw ~mono (a: <Flow.two_way; read : Cstruct.t>) (b: <Flow.two_way; read : Cstruct.t>) =
     let read_bytes = ref 0L in
     let read_ops = ref 0L in
     let write_bytes = ref 0L in
     let write_ops = ref 0L in
     let finish = ref None in
-    let start = Clock.elapsed_ns () in
+    let now_in_ns () = Eio.Time.Mono.now mono |> Mtime.to_uint64_ns in
+    let start = now_in_ns () in
     let rec loop () =
-      A.read a >>= function
-      | Error e ->
-        finish := Some (Clock.elapsed_ns ());
-        Lwt.return (Error (`A e))
-      | Ok `Eof ->
-        finish := Some (Clock.elapsed_ns ());
-        Lwt.return (Ok ())
-      | Ok (`Data buffer) ->
+      match a#read with
+      | exception End_of_file ->
+        finish := Some (now_in_ns ());
+        Ok ()
+      | exception e ->
+        finish := Some (now_in_ns ());
+        Error (`A e)
+      | buffer ->
         read_ops := Int64.succ !read_ops;
         read_bytes := Int64.(add !read_bytes (of_int @@ Cstruct.length buffer));
-        B.write b buffer
-        >>= function
-        | Ok () ->
+        match Flow.write b [buffer] with
+        | () ->
           write_ops := Int64.succ !write_ops;
           write_bytes := Int64.(add !write_bytes (of_int @@ Cstruct.length buffer));
           loop ()
-        | Error e ->
-          finish := Some (Clock.elapsed_ns ());
-          Lwt.return (Error (`B e))
+        | exception e ->
+          finish := Some (now_in_ns ());
+          Error (`B e)
     in
     {
       read_bytes;
@@ -127,62 +125,64 @@ struct
       write_ops;
       finish;
       start;
-      time = (fun () -> Clock.elapsed_ns ());
-      t = loop ();
+      time = (fun () -> now_in_ns ());
+      t = (Eio.Fiber.fork_promise ~sw loop);
     }
 
-  let wait t = t.t
+  let wait t = Eio.Promise.await_exn t.t
 
-  let copy ~src:a ~dst:b =
-    let t = start a b in
-    wait t >|= function
+  let copy ~mono ~src:a ~dst:b =
+    Eio.Switch.run @@ fun sw ->
+    let t = start ~sw ~mono a b in
+    match wait t with
     | Ok ()   -> Ok (stats t)
     | Error e -> Error e
 
 end
 
-module Proxy (Clock: Mirage_clock.MCLOCK) (A: SHUTDOWNABLE) (B: SHUTDOWNABLE) =
+module Proxy =
 struct
 
-  module A_to_B = Copy(Clock)(A)(B)
-  module B_to_A = Copy(Clock)(B)(A)
-
   type error = [
-    | `A of A_to_B.error
-    | `B of B_to_A.error
-    | `A_and_B of A_to_B.error * B_to_A.error
+    | `A of Copy.error
+    | `B of Copy.error
+    | `A_and_B of (Copy.error * Copy.error)
   ]
 
   let pp_error ppf = function
     | `A_and_B (e1, e2) ->
       Fmt.pf ppf "flow proxy a: %a; flow proxy b: %a"
-        A_to_B.pp_error e1 B_to_A.pp_error e2
-    | `A e -> Fmt.pf ppf "flow proxy a: %a" A_to_B.pp_error e
-    | `B e -> Fmt.pf ppf "flow proxy b: %a" B_to_A.pp_error e
+        Copy.pp_error e1 Copy.pp_error e2
+    | `A e -> Fmt.pf ppf "flow proxy a: %a" Copy.pp_error e
+    | `B e -> Fmt.pf ppf "flow proxy b: %a" Copy.pp_error e
 
-  let proxy a b =
+
+  let proxy ~mono a b =
+    Eio.Switch.run @@ fun sw ->
     let a2b =
-      let t = A_to_B.start a b in
-      A_to_B.wait t >>= fun result ->
-      A.shutdown_read a >>= fun () ->
-      B.shutdown_write b >|= fun () ->
+      Eio.Fiber.fork_promise ~sw @@ fun () ->
+      let t = Copy.start ~sw ~mono a b in
+      let result = Copy.wait t in
+      Eio.Flow.shutdown a `Receive;
+      Eio.Flow.shutdown b `Send;
       let stats = stats t in
       match result with
       | Ok ()   -> Ok stats
       | Error e -> Error e
     in
     let b2a =
-      let t = B_to_A.start b a in
-      B_to_A.wait t >>= fun result ->
-      B.shutdown_read b >>= fun () ->
-      A.shutdown_write a >|= fun () ->
+      Eio.Fiber.fork_promise ~sw @@ fun () ->
+      let t = Copy.start ~sw ~mono b a in
+      let result = Copy.wait t in
+      Eio.Flow.shutdown b `Receive;
+      Eio.Flow.shutdown a `Send;
       let stats = stats t in
       match result with
       | Ok ()   -> Ok stats
       | Error e -> Error e
     in
-    a2b >>= fun a_stats ->
-    b2a >|= fun b_stats ->
+    let a_stats = Eio.Promise.await_exn a2b in
+    let b_stats = Eio.Promise.await_exn b2a in
     match a_stats, b_stats with
     | Ok a_stats, Ok b_stats -> Ok (a_stats, b_stats)
     | Error e1  , Error e2   -> Error (`A_and_B (e1, e2))
@@ -193,9 +193,7 @@ end
 
 module F = struct
 
-  let (>>=) = Lwt.bind
-
-  type refill = Cstruct.t -> int -> int -> int Lwt.t
+  type refill = Cstruct.t -> int -> int -> int
 
   type error
   let pp_error ppf (_:error) =
@@ -204,18 +202,18 @@ module F = struct
   let pp_write_error = Mirage_flow.pp_write_error
 
   let seq f1 f2 buf off len =
-    f1 buf off len >>= function
+    match f1 buf off len with
     | 0 -> f2 buf off len
-    | n -> Lwt.return n
+    | n -> n
 
-  let zero _buf _off _len = Lwt.return 0
+  let zero _buf _off _len = 0
 
   let rec iter fn = function
     | []   -> zero
     | h::t -> seq (fn h) (iter fn t)
 
   type flow = {
-    close: unit -> unit Lwt.t;
+    close: unit -> unit;
     input: refill;
     output: refill;
     mutable buf: Cstruct.t;
@@ -225,7 +223,7 @@ module F = struct
 
   let default_buffer_size = 4096
 
-  let make ?(close=fun () -> Lwt.return_unit) ?input ?output () =
+  let make ?(close=fun () -> ()) ?input ?output () =
     let buf = Cstruct.create default_buffer_size in
     let ic_closed = input = None in
     let oc_closed = output = None in
@@ -237,24 +235,24 @@ module F = struct
     let str_off = ref 0 in
     let str_len = len str in
     fun buf off len ->
-      if !str_off >= str_len then Lwt.return 0
+      if !str_off >= str_len then 0
       else (
         let len = min (str_len - !str_off) len in
         blit str !str_off buf off len;
         str_off := !str_off + len;
-        Lwt.return len
+        len
       )
 
   let output_fn len blit str =
     let str_off = ref 0 in
     let str_len = len str in
     fun buf off len ->
-      if !str_off >= str_len then Lwt.return 0
+      if !str_off >= str_len then 0
       else (
         let len = min (str_len - !str_off) len in
         blit buf off str !str_off len;
         str_off := !str_off + len;
-        Lwt.return len
+        len
       )
 
   let mk fn_i fn_o ?input ?output () =
@@ -285,32 +283,32 @@ module F = struct
     )
 
   let read ch =
-    if ch.ic_closed then Lwt.return @@ Ok `Eof
+    if ch.ic_closed then Ok `Eof
     else (
       refill ch;
-      ch.input ch.buf 0 default_buffer_size >>= fun n ->
+      let n = ch.input ch.buf 0 default_buffer_size in
       if n = 0 then (
         ch.ic_closed <- true;
-        Lwt.return (Ok `Eof);
+        Ok `Eof;
       ) else (
         let ret = Cstruct.sub ch.buf 0 n in
         let buf = Cstruct.shift ch.buf n in
         ch.buf <- buf;
-        Lwt.return (Ok (`Data ret))
+        Ok (`Data ret)
       )
     )
 
   let write ch buf =
-    if ch.oc_closed then Lwt.return @@ Error `Closed
+    if ch.oc_closed then Error `Closed
     else (
       let len = Cstruct.length buf in
       let rec aux off =
-        if off = len then Lwt.return (Ok ())
+        if off = len then Ok ()
         else (
-          ch.output buf off (len - off) >>= fun n ->
+          let n = ch.output buf off (len - off) in
           if n = 0 then (
             ch.oc_closed <- true;
-            Lwt.return @@ Error `Closed
+            Error `Closed
           ) else aux (off+n)
         )
       in
@@ -318,13 +316,13 @@ module F = struct
     )
 
   let writev ch bufs =
-    if ch.oc_closed then Lwt.return @@ Error `Closed
+    if ch.oc_closed then Error `Closed
     else
       let rec aux = function
-        | []   -> Lwt.return (Ok ())
+        | []   -> Ok ()
         | h::t ->
-          write ch h >>= function
-          | Error e -> Lwt.return (Error e)
+          match write ch h with
+          | Error e -> Error e
           | Ok ()   -> aux t
       in
       aux bufs
@@ -361,13 +359,11 @@ let pp ppf (Flow (name, _, _)) = Fmt.string ppf name
 
 let forward ?(verbose=false) ~src ~dst () =
   let rec loop () =
-    read src >>= function
+    match read src with
     | Ok `Eof ->
-      Log.err (fun l -> l "forward[%a => %a] EOF" pp src pp dst);
-      Lwt.return_unit
+      Log.err (fun l -> l "forward[%a => %a] EOF" pp src pp dst)
     | Error e ->
-      Log.err (fun l -> l "forward[%a => %a] %a" pp src pp dst pp_error e);
-      Lwt.return_unit
+      Log.err (fun l -> l "forward[%a => %a] %a" pp src pp dst pp_error e)
     | Ok (`Data buf) ->
       Log.debug (fun l ->
           let payload =
@@ -375,17 +371,16 @@ let forward ?(verbose=false) ~src ~dst () =
             else Fmt.str "%d bytes" (Cstruct.length buf)
           in
           l "forward[%a => %a] %s" pp src pp dst payload);
-      write dst buf >>= function
+      match write dst buf with
       | Ok ()   -> loop ()
       | Error e ->
         Log.err (fun l -> l "forward[%a => %a] %a"
-                    pp src pp dst pp_write_error e);
-        Lwt.return_unit
+                    pp src pp dst pp_write_error e)
   in
   loop ()
 
 let proxy ?verbose f1 f2 =
-  Lwt.join [
-    forward ?verbose ~src:f1 ~dst:f2 ();
-    forward ?verbose ~src:f2 ~dst:f1 ();
+  Eio.Fiber.all [
+    forward ?verbose ~src:f1 ~dst:f2;
+    forward ?verbose ~src:f2 ~dst:f1;
   ]

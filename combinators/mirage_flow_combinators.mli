@@ -36,34 +36,30 @@ module Concrete (S: Mirage_flow.S): CONCRETE with type flow = S.flow
 module type SHUTDOWNABLE = sig
   include Mirage_flow.S
 
-  val shutdown_write: flow -> unit Lwt.t
+  val shutdown_write: flow -> unit
   (** Close the [write] direction of the flow, flushing any buffered
       data and causing future calls to [read] by the peer to return
       [`Eof]. *)
 
-  val shutdown_read: flow -> unit Lwt.t
+  val shutdown_read: flow -> unit
   (** Close the [read] direction of the flow, such that future calls
       to [write] by the peer will return [`Eof] *)
 end
 
-module Copy (Clock: Mirage_clock.MCLOCK) (A: Mirage_flow.S) (B: Mirage_flow.S): sig
+module Copy : sig
+  type error
 
-  type error = [`A of A.error | `B of B.write_error]
-  (** The type for copy errors. *)
+  val pp_error : error Fmt.t
 
-  val pp_error: error Fmt.t
-  (** [pp_error] pretty-prints errors. *)
-
-  val copy: src:A.flow -> dst:B.flow -> (Mirage_flow.stats, error) result Lwt.t
+  val copy: mono:Eio.Time.Mono.t -> src:<Eio.Flow.two_way; read : Cstruct.t> -> dst:<Eio.Flow.two_way; read : Cstruct.t> -> (Mirage_flow.stats, error) result
   (** [copy source destination] copies data from [source] to
       [destination] using the clock to compute a transfer rate. On
       successful completion, some statistics are returned. On failure we
       return a printable error. *)
-
 end
 
-module Proxy (Clock: Mirage_clock.MCLOCK) (A: SHUTDOWNABLE) (B: SHUTDOWNABLE):
-sig
+module Proxy : sig
+  open Eio
 
   type error
   (** The type for proxy errors. *)
@@ -71,13 +67,12 @@ sig
   val pp_error: error Fmt.t
   (** [pp_error] pretty-prints errors. *)
 
-  val proxy: A.flow -> B.flow ->
-    ((Mirage_flow.stats * Mirage_flow.stats), error) result Lwt.t
+  val proxy: mono:Eio.Time.Mono.t -> <Eio.Flow.two_way; read : Cstruct.t> -> <Eio.Flow.two_way; read : Cstruct.t> ->
+    ((Mirage_flow.stats * Mirage_flow.stats), error) result
   (** [proxy a b] proxies data between [a] and [b] until both
       sides close. If either direction encounters an error then so
       will [proxy]. If both directions succeed, then return I/O
       statistics. *)
-
 end
 
 module F: sig
@@ -86,11 +81,11 @@ module F: sig
 
   include Mirage_flow.S
 
-  type refill = Cstruct.t -> int -> int -> int Lwt.t
+  type refill = Cstruct.t -> int -> int -> int
   (** The type for refill functions. *)
 
   val make:
-    ?close:(unit -> unit Lwt.t) ->
+    ?close:(unit -> unit) ->
     ?input:refill ->
     ?output:refill ->
     unit -> flow
@@ -157,13 +152,13 @@ val create: (module Mirage_flow.S with type flow = 'a) -> 'a -> string -> t
 val pp: t Fmt.t
 (** [pp] is the pretty-printer for IO flows. *)
 
-val forward: ?verbose:bool -> src:t -> dst:t -> unit -> unit Lwt.t
+val forward: ?verbose:bool -> src:t -> dst:t -> unit -> unit
 (** [forward ?verbose ~src ~dst ()] forwards writes from [src] to
     [dst]. Block until either [src] or [dst] is closed. If [verbose]
     is set (by default it is not), show the full flow contents in the debug
     messages. *)
 
-val proxy: ?verbose:bool -> t -> t -> unit Lwt.t
+val proxy: ?verbose:bool -> t -> t -> unit
 (** [proxy ?verbose x y] is the same as [forward x y <*> forward y
     x]. Block until both flows are closed. If [verbose] is set (by
     default it is not), show the full flow contents in the debug

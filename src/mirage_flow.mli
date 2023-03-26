@@ -53,7 +53,7 @@ module type S = sig
   (** The type for flows. A flow represents the state of a single
       reliable stream that is connected to an endpoint. *)
 
-  val read: flow -> (Cstruct.t or_eof, error) result Lwt.t
+  val read: flow -> (Cstruct.t or_eof, error) result
   (** [read flow] blocks until some data is available and returns a
       fresh buffer containing it.
 
@@ -66,7 +66,7 @@ module type S = sig
       called [close] and when there is no more in-flight data.
    *)
 
-  val write: flow -> Cstruct.t -> (unit, write_error) result Lwt.t
+  val write: flow -> Cstruct.t -> (unit, write_error) result
   (** [write flow buffer] writes a buffer to the flow. There is no
       indication when the buffer has actually been read and, therefore,
       it must not be reused.  The contents may be transmitted in
@@ -75,7 +75,7 @@ module type S = sig
       connection is now closed and therefore the data could not be
       written.  Other errors are possible. *)
 
-  val writev: flow -> Cstruct.t list -> (unit, write_error) result Lwt.t
+  val writev: flow -> Cstruct.t list -> (unit, write_error) result
   (** [writev flow buffers] writes a sequence of buffers to the flow.
       There is no indication when the buffers have actually been read and,
       therefore, they must not be reused. The
@@ -83,7 +83,7 @@ module type S = sig
       connection is now closed and therefore the data could not be
       written.  Other errors are possible. *)
 
-  val close: flow -> unit Lwt.t
+  val close: flow -> unit
   (** [close flow] flushes all pending writes and signals the remote
       endpoint that there will be no future writes. Once the remote endpoint
       has read all pending data, it is expected that calls to [read] on

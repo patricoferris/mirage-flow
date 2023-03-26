@@ -33,10 +33,10 @@ module type S = sig
   type nonrec write_error = private [> write_error ]
   val pp_write_error: write_error Fmt.t
   type flow
-  val read: flow -> (Cstruct.t or_eof, error) result Lwt.t
-  val write: flow -> Cstruct.t -> (unit, write_error) result Lwt.t
-  val writev: flow -> Cstruct.t list -> (unit, write_error) result Lwt.t
-  val close: flow -> unit Lwt.t
+  val read: flow -> (Cstruct.t or_eof, error) result
+  val write: flow -> Cstruct.t -> (unit, write_error) result
+  val writev: flow -> Cstruct.t list -> (unit, write_error) result
+  val close: flow -> unit
 end
 
 type stats = {
